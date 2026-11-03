@@ -79,21 +79,52 @@ function adjusted(x,xg,impact,report,blend){
  const lambda=lh+la,p=1-Math.exp(-lambda)*(1+lambda+lambda*lambda/2);
  return {...x,lh,la,lambda,p,parts,flags};
 }
+function brier(p,y){return (p-y)**2}
+function loss(p,y){p=clamp(p,1e-6,1-1e-6);return -(y*Math.log(p)+(1-y)*Math.log(1-p))}
+function summarize(rows,fn){let n=rows.length,b=0,l=0,p=0,y=0;for(const r of rows){let z=clamp(fn(r),1e-6,1-1e-6);b+=brier(z,r.y);l+=loss(z,r.y);p+=z;y+=r.y}return {n,b:b/n,l:l/n,p:p/n,y:y/n}}
 function backtest(){
- if(!matches.length||demo){$('backtestResult').textContent='Backtest wymaga prawdziwych danych historycznych.';return}
- const rec=Number($('recent').value),weight=clamp((Number($('weight').value)||0)/100,0,1);
- const candidates=matches.slice(-300);let n=0,brier=0,actual=0,pred=0,baselineBrier=0,logLoss=0,baselineLogLoss=0;
- for(const m of candidates){
-  const r=calc(m.home,m.away,rec,weight,m.date);if(r.error)continue;
+ const target=$('backtestResult');
+ if(!matches.length||demo){target.textContent='Test wymaga prawdziwych danych historycznych.';return}
+ target.textContent='Obliczanie prognoz chronologicznych…';
+ // Walidacja służy do wyboru parametrów, test jest zamrożony i nie służy do strojenia.
+ // Mecze z tego samego dnia nie są używane do przewidywania innych meczów z tego dnia.
+ const pool=matches.slice(-650),rows=[];
+ const settings=[5,10,15,20].flatMap(rec=>[0,.35,.7].map(weight=>({rec,weight})));
+ for(const m of pool){
   const prior=matches.filter(x=>x.date<m.date);
   if(prior.length<100)continue;
-  const base=prior.filter(x=>x.hg+x.ag>=3).length/prior.length;
-  const y=m.hg+m.ag>=3?1:0,p=clamp(r.p,0.000001,0.999999),q=clamp(base,0.000001,0.999999);
-  n++;brier+=(p-y)**2;baselineBrier+=(q-y)**2;actual+=y;pred+=p;
-  logLoss-=y*Math.log(p)+(1-y)*Math.log(1-p);
-  baselineLogLoss-=y*Math.log(q)+(1-y)*Math.log(1-q);
+  const y=Number(m.hg+m.ag>=3),q=clamp(prior.filter(x=>x.hg+x.ag>=3).length/prior.length,1e-6,1-1e-6);
+  const forecasts=settings.map(s=>{const z=calc(m.home,m.away,s.rec,s.weight,m.date);return z.error?null:z.p});
+  if(forecasts.some(p=>p===null))continue; // ta sama próba dla wszystkich modeli
+  rows.push({date:m.date,y,q,forecasts});
  }
- $('backtestResult').textContent=n?`Backtest chronologiczny: ${n} z ostatnich 300 meczów (bez wyników z dnia typowanego). Brier modelu ${(brier/n).toFixed(4)}; Brier punktu odniesienia ${(baselineBrier/n).toFixed(4)}. Log Loss modelu ${(logLoss/n).toFixed(4)}; Log Loss odniesienia ${(baselineLogLoss/n).toFixed(4)}. Mniej = lepiej. Średnia prognoza ${pct(pred/n)}, faktyczne Over 2,5 ${pct(actual/n)}. Punkt odniesienia: historyczny udział Over 2,5 przed każdym meczem. UWAGA: test wyłącznie modelu bramkowego, bez historycznych xG i absencji; nie dowodzi skuteczności dodatniego EV.`:'Za mało danych do testu historycznego.';
+ if(rows.length<220){target.textContent=`Za mało kwalifikujących się spotkań (${rows.length}). Potrzeba co najmniej 220.`;return}
+ // Podział według dat, aby ten sam dzień nie występował po obu stronach granicy.
+ const split=Math.floor(rows.length/2),boundary=rows[split].date;
+ const validation=rows.filter(r=>r.date<boundary),test=rows.filter(r=>r.date>=boundary);
+ if(validation.length<100||test.length<100){target.textContent='Za mało spotkań w walidacji lub teście.';return}
+ let best=null;
+ for(let i=0;i<settings.length;i++)for(const alpha of [0,.25,.5,.75,1]){
+  const score=summarize(validation,r=>alpha*r.forecasts[i]+(1-alpha)*r.q);
+  if(!best||score.b<best.b-1e-12)best={i,alpha,b:score.b};
+ }
+ const baseline=summarize(test,r=>r.q);
+ const originalIdx=settings.findIndex(s=>s.rec===10&&s.weight===.35);
+ const original=summarize(test,r=>r.forecasts[originalIdx]);
+ const tuned=summarize(test,r=>r.forecasts[best.i]);
+ const blend=summarize(test,r=>best.alpha*r.forecasts[best.i]+(1-best.alpha)*r.q);
+ const fmt=x=>x.toFixed(4),percent=x=>(x*100).toFixed(1).replace('.',',')+'%';
+ const row=(label,s)=>`<tr><td>${esc(label)}</td><td>${fmt(s.b)}</td><td>${fmt(s.l)}</td><td>${percent(s.p)}</td></tr>`;
+ const bins=[];for(let k=0;k<5;k++){const subset=test.filter(r=>{let p=best.alpha*r.forecasts[best.i]+(1-best.alpha)*r.q;return p>=k/5&&(k===4||p<(k+1)/5)});if(subset.length)bins.push({k,s:summarize(subset,r=>best.alpha*r.forecasts[best.i]+(1-best.alpha)*r.q)});}
+ const config=settings[best.i],diff=blend.b-baseline.b;
+ target.innerHTML=`<p><strong>Walidacja:</strong> ${validation.length} meczów (wybór parametrów). <strong>Test poza próbą:</strong> ${test.length} późniejszych meczów. Granica: ${esc(boundary)}. Wyniki danego dnia nie są dostępne w prognozie.</p>`+
+ `<p>Wybrane tylko na walidacji: ostatnie <b>${config.rec}</b> meczów, waga formy <b>${Math.round(config.weight*100)}%</b>, udział Poissona <b>${Math.round(best.alpha*100)}%</b>, udział częstości historycznej <b>${Math.round((1-best.alpha)*100)}%</b>.</p>`+
+ `<div class="scroll"><table><thead><tr><th>Model na teście</th><th>Brier ↓</th><th>Log Loss ↓</th><th>Śr. prognoza</th></tr></thead><tbody>`+
+ row('Punkt odniesienia — częstość historyczna',baseline)+row('Poisson 1.5 (10 meczów, 35%)',original)+row('Poisson po strojeniu',tuned)+row('Mieszanka wybrana na walidacji',blend)+`</tbody></table></div>`+
+ `<p>Rzeczywiste Over 2,5 na teście: <b>${percent(blend.y)}</b>. Różnica Brier mieszanki wobec punktu odniesienia: <b>${diff>0?'+':''}${fmt(diff)}</b> (${diff<0?'niżej — lepiej':diff>0?'wyżej — gorzej':'remis'}). Różnice mogą być przypadkowe.</p>`+
+ `<h3>Kalibracja mieszanki na zbiorze testowym</h3><div class="scroll"><table><thead><tr><th>Przedział prognozy</th><th>Mecze</th><th>Śr. prognoza</th><th>Faktyczne Over 2,5</th></tr></thead><tbody>`+
+ bins.map(z=>`<tr><td>${z.k*20}–${(z.k+1)*20}%</td><td>${z.s.n}</td><td>${percent(z.s.p)}</td><td>${percent(z.s.y)}</td></tr>`).join('')+`</tbody></table></div>`+
+ `<p class="warning">Ważne: strojenie dotyczy tylko historycznego modelu bramkowego. Brak historycznych xG i absencji. To pojedynczy podział czasowy, nie dowód przewagi ani dodatniego EV. Ustawienia wybrane na walidacji są prezentowane do analizy, ale nie zmieniają automatycznie typowania meczów.</p>`;
 }
 function pct(v){return (100*v).toFixed(1).replace('.',',')+'%'}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
