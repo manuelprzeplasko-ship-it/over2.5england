@@ -12,7 +12,7 @@ for year in range(2021,2027):
         try:
             req=urllib.request.Request(url,headers={'User-Agent':'EnglandOverLab/1.8 (historical research)'})
             with urllib.request.urlopen(req,timeout=25) as response:
-                content=response.read().decode('cp1252-sig',errors='replace')
+                content=response.read().decode('cp1252',errors='replace')
             count=0
             for row in csv.DictReader(io.StringIO(content)):
                 if not row or row.get('FTR') not in ('H','D','A'): continue
